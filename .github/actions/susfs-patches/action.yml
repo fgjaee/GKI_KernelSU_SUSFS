@@ -23,6 +23,24 @@ runs:
         cp "${{ github.workspace }}/susfs4ksu/kernel_patches/include/linux/"* "${{ github.workspace }}/kernel/common/include/linux/"
         cp ${{ github.workspace }}/susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ inputs.version }}.patch ./
 
+    - name: Normalize SuSFS mount group allocation
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        header="include/linux/susfs_def.h"
+
+        grep -q '^#define DEFAULT_KSU_MNT_GROUP_ID 200000 ' "$header" || {
+          echo "::error::Unexpected SuSFS mount-group definition"
+          grep -n 'DEFAULT_KSU_MNT_GROUP_ID' "$header" || true
+          exit 1
+        }
+
+        sed -i \
+          's/^#define DEFAULT_KSU_MNT_GROUP_ID 200000 /#define DEFAULT_KSU_MNT_GROUP_ID 1 /' \
+          "$header"
+
+        grep -n '^#define DEFAULT_KSU_MNT_GROUP_ID ' "$header"
+
     - name: Apply Android 12 5.10 Fake Patches
       shell: bash
       if: inputs.version == 'android12-5.10'
