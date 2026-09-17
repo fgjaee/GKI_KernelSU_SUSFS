@@ -1,0 +1,51 @@
+name: Dispatch peer-group experiment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/dispatch-peer-group-test.yml"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch Android 15 / 6.6 LTS ReSukiSU test
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > payload.json <<'JSON'
+          {
+            "ref": "peer-group-test",
+            "inputs": {
+              "release_type": "Action",
+              "use_cache": true,
+              "allow_version_mismatch": false,
+              "kernel_build_version": "6.6.x-android15",
+              "os_patch_level": "lts",
+              "brand_name": "Wild",
+              "keep_kmi": false,
+              "commit_mode": "verified",
+              "root_flavor": "ReSukiSU",
+              "use_susfs": true,
+              "use_nomount": true,
+              "use_bbg": true,
+              "use_net": true,
+              "use_ds": true,
+              "use_ntsync": true,
+              "use_ptrace": true,
+              "use_unicode": true,
+              "use_bpf": true,
+              "use_perf": false,
+              "test_release_notes": false
+            }
+          }
+          JSON
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/workflows/main.yml/dispatches" --input payload.json
+          echo "Dispatched main.yml at peer-group-test"
