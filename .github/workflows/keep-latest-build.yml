@@ -1,0 +1,143 @@
+name: Keep latest build in Releases
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/keep-latest-build.yml'
+  workflow_run:
+    workflows: ["Build*", "* build", "* Build", "Android*", "kjmod*", "Compile*", "Package*", "Release*", "CI*", "* APK*", "NexGen*", "Produce*"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: latest-build-maintenance
+  cancel-in-progress: false
+
+jobs:
+  publish-and-clean:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Publish latest successful build, then prune older build artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/latest-dist
+          cd /tmp
+
+          # List all retained artifacts. Never select logs, diagnostics, data
+          # snapshots, or explicitly unsafe/unverified kernel-module builds.
+          gh api --paginate "repos/$GH_REPO/actions/artifacts?per_page=100" |
+            jq -sr '[.[] | .artifacts[]] | unique_by(.id) | sort_by(.created_at) | reverse' > artifacts.json
+          jq -r '.[] | select(.expired == false) |
+            [.id, .name, .workflow_run.id, .created_at] | @tsv' artifacts.json > artifacts.tsv
+
+          selected_id=""
+          selected_name=""
+          selected_run=""
+          selected_sha=""
+
+          while IFS=$'\t' read -r artifact_id artifact_name run_id created_at; do
+            lower="${artifact_name,,}"
+            [[ "$lower" =~ (app|apk|build|bundle|module|zip|release|kjmod|safepif|ghostlock|android|nexgen|aireply|achievers|workday|nois|fresh|susaf|aerial|lkm|kernel|plugin|pkg) ]] || continue
+            [[ "$lower" =~ (unverified|do.not.flash|inspection.only|lab.only|test|log|report|evidence|diagnostic|smoke|refresh|input|cache|backup) ]] && continue
+            [[ -n "$run_id" && "$run_id" != "null" ]] || continue
+
+            run_json="$(gh api "repos/$GH_REPO/actions/runs/$run_id")"
+            [[ "$(jq -r '.conclusion' <<< "$run_json")" == "success" ]] || continue
+
+            rm -rf /tmp/latest-dist
+            mkdir -p /tmp/latest-dist
+            if ! gh run download "$run_id" --repo "$GH_REPO" --name "$artifact_name" --dir /tmp/latest-dist; then
+              continue
+            fi
+            mapfile -d '' files < <(
+              find /tmp/latest-dist -type f \( -iname '*.apk' -o -iname '*.aab' -o -iname '*.zip' \) -print0
+            )
+            (( ${#files[@]} > 0 )) || continue
+
+            selected_id="$artifact_id"
+            selected_name="$artifact_name"
+            selected_run="$run_id"
+            selected_sha="$(jq -r '.head_sha' <<< "$run_json")"
+            break
+          done < artifacts.tsv
+
+          if [[ -z "$selected_id" ]]; then
+            echo "No verified, retained successful build artifact to publish. Nothing deleted." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Release stays a prerelease because CI success does not prove
+          # end-to-end stability on physical hardware.
+          release_tag="latest-ci-build"
+          notes="Automated snapshot of latest successful distributable build.
+          Source run: https://github.com/$GH_REPO/actions/runs/$selected_run
+          Source commit: $selected_sha
+          Source artifact: $selected_name
+          Build artifacts are not necessarily device-tested."
+
+          if ! gh release view "$release_tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release create "$release_tag" --repo "$GH_REPO" \
+              --target "$selected_sha" --title "Latest CI build" \
+              --prerelease --notes "$notes"
+          fi
+
+          : > /tmp/published-names.txt
+          mapfile -d '' files < <(
+            find /tmp/latest-dist -type f \( -iname '*.apk' -o -iname '*.aab' -o -iname '*.zip' \) -print0
+          )
+          for file in "${files[@]}"; do
+            filename="run-${selected_run}-$(basename "$file")"
+            cp "$file" "/tmp/$filename"
+            gh release upload "$release_tag" "/tmp/$filename" \
+              --repo "$GH_REPO" --clobber
+            echo "$filename" >> /tmp/published-names.txt
+          done
+
+          gh release edit "$release_tag" --repo "$GH_REPO" \
+            --title "Latest CI build (run $selected_run)" \
+            --notes "$notes" --prerelease
+          release_json="$(gh api "repos/$GH_REPO/releases/tags/$release_tag")"
+          while IFS= read -r filename; do
+            jq -e --arg n "$filename" '.assets[] | select(.name == $n)' \
+              <<< "$release_json" >/dev/null
+          done < /tmp/published-names.txt
+
+          # Prune older assets from this *managed* release, only after new
+          # assets have been uploaded and checked.
+          jq -r '.assets[] | [.id, .name] | @tsv' <<< "$release_json" |
+          while IFS=$'\t' read -r asset_id asset_name; do
+            if ! grep -Fxq "$asset_name" /tmp/published-names.txt; then
+              gh api -X DELETE "repos/$GH_REPO/releases/assets/$asset_id"
+            fi
+          done
+
+          # Delete only older distributable build artifacts. Keep workflows'
+          # data snapshots, logs, diagnostic results, and unsafe builds.
+          deleted=0
+          while IFS=$'\t' read -r artifact_id artifact_name run_id created_at; do
+            [[ "$artifact_id" != "$selected_id" ]] || continue
+            lower="${artifact_name,,}"
+            [[ "$lower" =~ (app|apk|build|bundle|module|zip|release|kjmod|safepif|ghostlock|android|nexgen|aireply|achievers|workday|nois|fresh|susaf|aerial|lkm|kernel|plugin|pkg) ]] || continue
+            [[ "$lower" =~ (unverified|do.not.flash|inspection.only|lab.only|test|log|report|evidence|diagnostic|smoke|refresh|input|cache|backup) ]] && continue
+            gh api -X DELETE "repos/$GH_REPO/actions/artifacts/$artifact_id"
+            deleted=$((deleted + 1))
+          done < artifacts.tsv
+
+          {
+            echo "### Latest successful build published"
+            echo "Release: https://github.com/$GH_REPO/releases/tag/$release_tag"
+            echo "Source artifact: $selected_name (ID $selected_id)"
+            echo "Source run: $selected_run"
+            echo "Older build artifacts deleted: $deleted"
+            echo "Other artifact types were preserved."
+          } >> "$GITHUB_STEP_SUMMARY"
